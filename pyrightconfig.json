@@ -1,0 +1,6 @@
+{
+  "venvPath": ".",
+  "venv": ".pte",
+  "typeCheckingMode": "basic",
+  "reportPrivateImportUsage": false
+}

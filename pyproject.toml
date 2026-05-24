@@ -1,0 +1,28 @@
+[project]
+name = "petvllm"
+version = "0.1.0"
+description = "A from-scratch LLM serving engine, built lesson by lesson"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.51",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "triton>=3.0",
+    "flash-attn",
+]
+serve = [
+    "fastapi",
+    "uvicorn",
+]
+dev = [
+    "pytest",
+    "ipython",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
