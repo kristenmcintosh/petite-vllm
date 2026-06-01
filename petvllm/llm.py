@@ -1,5 +1,6 @@
 import torch
 import time
+from dataclasses import dataclass
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from petvllm.config import Qwen3Config
@@ -7,14 +8,20 @@ from petvllm.models.qwen3 import Qwen3ForCausalLM
 from petvllm.layers.sampler import sample
 
 
+@dataclass
+class VllmConfig:
+    max_seq_len: int
+
+
 class LLM:
-    def __init__(self, model_name: str, device: str = "cpu"):
+    def __init__(self, model_name: str, vllm_config: VllmConfig, device: str = "cpu"):
         self.device = device
         self.tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.config = Qwen3Config.from_pretrained(model_name)
+        self.vllm_config = vllm_config
 
+        model_config = Qwen3Config.from_pretrained(model_name)
         # Step 1: create our model (random weights)
-        self.model = Qwen3ForCausalLM(self.config)
+        self.model = Qwen3ForCausalLM(model_config, vllm_config.max_seq_len)
 
         # Step 2: load pretrained weights from HuggingFace
         hf_model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -50,37 +57,62 @@ class LLM:
         self.model.to(device)
         self.model.eval()
 
+    def prefill(self, toks: torch.Tensor, temperature: float, top_k: int):
+        """
+        Run Prefill step:
+        Forward pass through the entire prompt once, return the first token
+        """
+        positions = torch.arange(
+            toks.shape[1]
+        )  # get positions based on current_seq_len
+        all_logits = self.model.forward(toks, positions)
+        last_logits = all_logits[:, -1, :]
+        return sample(last_logits, temperature, top_k)
+
+    def decode(self, toks, max_output_tokens: int, temperature, top_k):
+        for _ in range(1, max_output_tokens):
+            positions = torch.tensor(
+                [toks.shape[1] - 1]
+            )  # get positions based on current_seq_len
+            all_logits = self.model.forward(toks[:, -1:], positions)
+            last_logits = all_logits[:, -1, :]
+            new_tkn = sample(last_logits, temperature, top_k)
+            toks = torch.cat([toks, new_tkn.unsqueeze(0)], dim=-1)
+        return toks
+
     def generate(
         self,
         prompt: str,
-        max_tokens: int = 50,
+        max_output_tokens: int = 50,
         temperature: float = 1.0,
         top_k: int = 50,
     ):
         # Step 1: tokenize the prompt
+        # For each new token:
         # input_ids shape: (1, seq_len)
+
         toks = self.tokenizer.encode(prompt, return_tensors="pt")
         prompt_len = toks.shape[1]
-        # Step 2: generation loop
-        # For each new token:
-        #   - create positions tensor: [0, 1, 2, ..., current_seq_len - 1]
-        #   - forward pass through model → logits (1, seq_len, vocab_size)
-        #   - take only the LAST token's logits → (1, vocab_size)
-        #   - sample → next token id
-        #   - append to input_ids
-        #   - stop if EOS token
-        # Note: without KV cache, we re-run the FULL sequence every step (slow!)
-        start = time.time()
-        for tok_id in range(max_tokens):
-            positions = torch.arange(toks.shape[1]) # get positions based on current_seq_len
 
-            all_logits = self.model.forward(toks, positions)
-            last_logits = all_logits[:, -1, :]
-            new_tkn = sample(last_logits, temperature, top_k)
-            toks = torch.cat([toks, new_tkn.unsqueeze(0)], dim=-1)
-        # Step 3: detokenize and return
-        elapsed = time.time() - start
+        # validate that the input/output token count does not exceed max_seq_len
+        # as we only allocate enough kv cache space for max_seq_len
+        assert self.vllm_config.max_seq_len >= prompt_len + max_output_tokens, (
+            f"Expected max_seq_len ({self.vllm_config.max_seq_len}) to be >= {prompt_len} + {max_output_tokens}"
+        )
+
+        start_prefill = time.time()
+        first_tok = self.prefill(toks, temperature, top_k)
+        elapsed_ttft = time.time() - start_prefill
+        toks = torch.cat([toks, first_tok.unsqueeze(0)], dim=-1)
+
+        start_decode = time.time()
+        toks = self.decode(toks, max_output_tokens, temperature, top_k)
+        elapsed = time.time() - start_decode
+
         # Also print tokens/sec for benchmarking
-        print(f"{max_tokens / elapsed:.1f} tokens/sec")
+        print(f"time to first token: {elapsed_ttft}")
+        print(f"{max_output_tokens / elapsed:.1f} tokens/sec")
+
+        # Step 3: detokenize and return
         output = self.tokenizer.decode(toks[0, prompt_len:])
         return output
