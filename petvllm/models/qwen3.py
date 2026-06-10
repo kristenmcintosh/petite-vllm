@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from petvllm.cache import kv_cache
-from petvllm.cache.kv_cache import KVCache
+from petvllm.cache.kv_cache_manager import KVCacheManager
 from petvllm.config import Qwen3Config
 from petvllm.layers.activation import SiluAndMul
 from petvllm.layers.embed_head import LMHead, VocabEmbedding
@@ -14,7 +13,10 @@ from petvllm.layers.rotary_embedding import RotaryEmbedding, apply_rotary_emb
 
 class Qwen3Attention(nn.Module):
     def __init__(
-        self, config: Qwen3Config, layer_idx: int, kv_cache: KVCache | None = None
+        self,
+        config: Qwen3Config,
+        layer_idx: int,
+        kv_cache: KVCacheManager | None = None,
     ):
         super().__init__()
 
@@ -48,8 +50,6 @@ class Qwen3Attention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # print(q.shape, k.shape, v.shape)
-
         # output of qkv projections will be
         # batch, seq, and compact view of all heads
         # (head_dim * num_heads).
@@ -65,9 +65,16 @@ class Qwen3Attention(nn.Module):
         q, k = apply_rotary_emb(q, k, cos, sin)
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(self.layer_idx, k, v)
+            full_ks, full_vs = [], []
+            for seq_id in range(batch):
+                full_k, full_v = self.kv_cache.update(
+                    self.layer_idx, seq_id, k[seq_id], v[seq_id]
+                )
+                full_ks.append(full_k)
+                full_vs.append(full_v)
 
-        # print(q.shape, k.shape, v.shape)
+            k = torch.stack(full_ks, dim=0)
+            v = torch.stack(full_vs, dim=0)
 
         k = torch.repeat_interleave(k, self.num_kv_groups, dim=2)
         v = torch.repeat_interleave(v, self.num_kv_groups, dim=2)
@@ -104,7 +111,7 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int, kv_cache: KVCache):
+    def __init__(self, config: Qwen3Config, layer_idx: int, kv_cache: KVCacheManager):
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = Qwen3Attention(config, layer_idx, kv_cache)
@@ -120,20 +127,14 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    def __init__(self, config: Qwen3Config, max_seq_len: int):
+    def __init__(self, config: Qwen3Config, kv_cache: KVCacheManager):
         super().__init__()
         self.config = config
-        self.kv_cache = KVCache(
-            config.num_hidden_layers,
-            config.num_key_value_heads,
-            config.head_dim,
-            max_seq_len,
-        )
 
         self.embed_tokens = VocabEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(config, layer_idx, self.kv_cache)
+                Qwen3DecoderLayer(config, layer_idx, kv_cache)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )

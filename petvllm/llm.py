@@ -3,6 +3,7 @@ import time
 from dataclasses import dataclass
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from petvllm.cache.kv_cache_manager import KVCacheConfig, KVCacheManager
 from petvllm.config import Qwen3Config
 from petvllm.models.qwen3 import Qwen3ForCausalLM
 from petvllm.layers.sampler import sample
@@ -11,6 +12,7 @@ from petvllm.layers.sampler import sample
 @dataclass
 class VllmConfig:
     max_seq_len: int
+    kv_config: KVCacheConfig
 
 
 class LLM:
@@ -21,7 +23,9 @@ class LLM:
 
         model_config = Qwen3Config.from_pretrained(model_name)
         # Step 1: create our model (random weights)
-        self.model = Qwen3ForCausalLM(model_config, vllm_config.max_seq_len)
+
+        self.cache_manager = KVCacheManager(vllm_config.kv_config, model_config)
+        self.model = Qwen3ForCausalLM(model_config, self.cache_manager)
 
         # Step 2: load pretrained weights from HuggingFace
         hf_model = AutoModelForCausalLM.from_pretrained(model_name)
@@ -58,22 +62,18 @@ class LLM:
         self.model.eval()
 
     def prefill(self, toks: torch.Tensor, temperature: float, top_k: int):
-        """
-        Run Prefill step:
-        Forward pass through the entire prompt once, return the first token
-        """
-        positions = torch.arange(
-            toks.shape[1]
-        )  # get positions based on current_seq_len
+        for seq_id in range(toks.shape[0]):
+            self.cache_manager.update_block_tables(seq_id, toks.shape[1])
+        positions = torch.arange(toks.shape[1])
         all_logits = self.model.forward(toks, positions)
         last_logits = all_logits[:, -1, :]
         return sample(last_logits, temperature, top_k)
 
     def decode(self, toks, max_output_tokens: int, temperature, top_k):
         for _ in range(1, max_output_tokens):
-            positions = torch.tensor(
-                [toks.shape[1] - 1]
-            )  # get positions based on current_seq_len
+            for seq_id in range(toks.shape[0]):
+                self.cache_manager.update_block_tables(seq_id, 1)
+            positions = torch.tensor([toks.shape[1] - 1])
             all_logits = self.model.forward(toks[:, -1:], positions)
             last_logits = all_logits[:, -1, :]
             new_tkn = sample(last_logits, temperature, top_k)
@@ -99,6 +99,8 @@ class LLM:
         assert self.vllm_config.max_seq_len >= prompt_len + max_output_tokens, (
             f"Expected max_seq_len ({self.vllm_config.max_seq_len}) to be >= {prompt_len} + {max_output_tokens}"
         )
+        for i in range(toks.shape[0]):
+            self.cache_manager.register_sequence(i)
 
         start_prefill = time.time()
         first_tok = self.prefill(toks, temperature, top_k)
