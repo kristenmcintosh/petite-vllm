@@ -26,3 +26,11 @@ class BlockPool:
     def free(self, block: Block):
         """Return a block to the free block queue"""
         self.free_blocks_queue.append(block)
+
+    @property
+    def num_free(self) -> int:
+        return len(self.free_blocks_queue)
+
+    @property
+    def num_used(self) -> int:
+        return self.num_blocks - self.num_free

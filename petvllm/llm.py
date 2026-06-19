@@ -1,5 +1,4 @@
 import torch
-import time
 from dataclasses import dataclass
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -7,6 +6,7 @@ from petvllm.cache.kv_cache_manager import KVCacheConfig, KVCacheManager
 from petvllm.config import Qwen3Config
 from petvllm.models.qwen3 import Qwen3ForCausalLM
 from petvllm.layers.sampler import sample
+from petvllm.metrics import Metrics
 
 
 @dataclass
@@ -94,27 +94,33 @@ class LLM:
         toks = self.tokenizer.encode(prompt, return_tensors="pt")
         prompt_len = toks.shape[1]
 
-        # validate that the input/output token count does not exceed max_seq_len
-        # as we only allocate enough kv cache space for max_seq_len
         assert self.vllm_config.max_seq_len >= prompt_len + max_output_tokens, (
             f"Expected max_seq_len ({self.vllm_config.max_seq_len}) to be >= {prompt_len} + {max_output_tokens}"
         )
+
+        metrics = Metrics()
+        metrics.latency.prompt_tokens = prompt_len
+        metrics.latency.start_e2e()
+
         for i in range(toks.shape[0]):
             self.cache_manager.register_sequence(i)
 
-        start_prefill = time.time()
+        metrics.latency.start_prefill()
         first_tok = self.prefill(toks, temperature, top_k)
-        elapsed_ttft = time.time() - start_prefill
+        metrics.latency.end_prefill()
         toks = torch.cat([toks, first_tok.unsqueeze(0)], dim=-1)
 
-        start_decode = time.time()
+        metrics.latency.start_decode()
         toks = self.decode(toks, max_output_tokens, temperature, top_k)
-        elapsed = time.time() - start_decode
+        metrics.latency.end_decode(max_output_tokens)
 
-        # Also print tokens/sec for benchmarking
-        print(f"time to first token: {elapsed_ttft}")
-        print(f"{max_output_tokens / elapsed:.1f} tokens/sec")
+        metrics.latency.end_e2e()
+        metrics.cache.record(
+            self.cache_manager.block_pool.num_used,
+            self.cache_manager.block_pool.num_blocks,
+        )
 
-        # Step 3: detokenize and return
+        print(metrics.summary())
+
         output = self.tokenizer.decode(toks[0, prompt_len:])
         return output
