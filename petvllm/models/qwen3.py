@@ -145,6 +145,32 @@ class Qwen3ForCausalLM(nn.Module):
             weight=self.embed_tokens.weight if config.tie_word_embeddings else None,
         )
 
+    def load_weights(self, model_name: str):
+        from transformers import AutoModelForCausalLM
+
+        hf_model = AutoModelForCausalLM.from_pretrained(model_name)
+        hf_state = hf_model.state_dict()
+
+        remapped = {}
+        for key, value in hf_state.items():
+            if key == "lm_head.weight":
+                continue
+
+            new_key = key.removeprefix("model.")
+
+            if "gate_proj.weight" in new_key:
+                up_key = key.replace("gate_proj", "up_proj")
+                remapped[new_key.replace("gate_proj", "gate_up_proj")] = torch.cat(
+                    [value, hf_state[up_key]], dim=0
+                )
+                continue
+            if "up_proj.weight" in new_key:
+                continue
+
+            remapped[new_key] = value
+
+        self.load_state_dict(remapped, strict=False)
+
     def forward(self, input_ids, positions):
         x = self.embed_tokens(input_ids)  # go from vocab_size -> hidden_size
         for layer in self.layers:

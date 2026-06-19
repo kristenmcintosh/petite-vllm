@@ -3,18 +3,22 @@ from transformers import AutoConfig
 
 
 @dataclass
-class Qwen3Config:
-    hidden_size: int = 1024
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 8
-    head_dim: int = 128
-    intermediate_size: int = 3072
-    num_hidden_layers: int = 28
-    vocab_size: int = 151936
+class ModelConfig:
+    hidden_size: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+    intermediate_size: int = 0
+    num_hidden_layers: int = 0
+    vocab_size: int = 0
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 1000000.0
-    max_position_embeddings: int = 40960
+    max_position_embeddings: int = 0
     tie_word_embeddings: bool = True
+
+
+@dataclass
+class Qwen3Config(ModelConfig):
+    rope_theta: float = 1000000.0
 
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Qwen3Config":

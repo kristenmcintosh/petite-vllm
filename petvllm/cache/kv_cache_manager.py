@@ -2,7 +2,7 @@ import torch
 from dataclasses import dataclass
 
 from petvllm.cache.block_pool import Block
-from petvllm.config import Qwen3Config
+from petvllm.config import ModelConfig
 from petvllm.cache.block_kv_cache import BlockKVCache
 from petvllm.cache.block_pool import BlockPool
 
@@ -26,7 +26,7 @@ class KVCacheConfig:
 
 
 class KVCacheManager:
-    def __init__(self, kv_config: KVCacheConfig, model_config: Qwen3Config):
+    def __init__(self, kv_config: KVCacheConfig, model_config: ModelConfig):
         self.block_size = kv_config.block_size
         self.kv_cache = BlockKVCache(
             model_config.num_hidden_layers,

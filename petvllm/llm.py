@@ -1,11 +1,10 @@
 import torch
 from dataclasses import dataclass
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 from petvllm.cache.kv_cache_manager import KVCacheConfig, KVCacheManager
 from petvllm.config import Qwen3Config
-from petvllm.models.qwen3 import Qwen3ForCausalLM
-from petvllm.layers.sampler import sample
+from petvllm.engine.model_runner import ModelRunner
 from petvllm.metrics import Metrics
 
 
@@ -17,68 +16,12 @@ class VllmConfig:
 
 class LLM:
     def __init__(self, model_name: str, vllm_config: VllmConfig, device: str = "cpu"):
-        self.device = device
-        self.tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_name)
         self.vllm_config = vllm_config
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         model_config = Qwen3Config.from_pretrained(model_name)
-        # Step 1: create our model (random weights)
-
         self.cache_manager = KVCacheManager(vllm_config.kv_config, model_config)
-        self.model = Qwen3ForCausalLM(model_config, self.cache_manager)
-
-        # Step 2: load pretrained weights from HuggingFace
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name)
-        hf_state = hf_model.state_dict()
-
-        # remap the hf state dict to match the petite-vllm format
-        # 1. strip the hf model prefix
-        # 2. skip lm, lm_head
-        # 3. concatenate gate_proj and up_proj since those are fused in petvllm
-        remapped = {}
-        for key, value in hf_state.items():
-            # skip lm_head (tied to embed_tokens)
-            if key == "lm_head.weight":
-                continue
-
-            # strip "model." prefix
-            new_key = key.removeprefix("model.")
-
-            # fuse gate_proj + up_proj → gate_up_proj
-            if "gate_proj.weight" in new_key:
-                up_key = key.replace("gate_proj", "up_proj")
-                remapped[new_key.replace("gate_proj", "gate_up_proj")] = torch.cat(
-                    [value, hf_state[up_key]], dim=0
-                )
-                continue
-            if "up_proj.weight" in new_key:
-                continue  # already handled above
-
-            remapped[new_key] = value
-
-        self.model.load_state_dict(remapped, strict=False)
-
-        self.model.to(device)
-        self.model.eval()
-
-    def prefill(self, toks: torch.Tensor, temperature: float, top_k: int):
-        for seq_id in range(toks.shape[0]):
-            self.cache_manager.update_block_tables(seq_id, toks.shape[1])
-        positions = torch.arange(toks.shape[1])
-        all_logits = self.model.forward(toks, positions)
-        last_logits = all_logits[:, -1, :]
-        return sample(last_logits, temperature, top_k)
-
-    def decode(self, toks, max_output_tokens: int, temperature, top_k):
-        for _ in range(1, max_output_tokens):
-            for seq_id in range(toks.shape[0]):
-                self.cache_manager.update_block_tables(seq_id, 1)
-            positions = torch.tensor([toks.shape[1] - 1])
-            all_logits = self.model.forward(toks[:, -1:], positions)
-            last_logits = all_logits[:, -1, :]
-            new_tkn = sample(last_logits, temperature, top_k)
-            toks = torch.cat([toks, new_tkn.unsqueeze(0)], dim=-1)
-        return toks
+        self.model_runner = ModelRunner(model_name, "qwen3", model_config, self.cache_manager, device)
 
     def generate(
         self,
@@ -87,10 +30,6 @@ class LLM:
         temperature: float = 1.0,
         top_k: int = 50,
     ):
-        # Step 1: tokenize the prompt
-        # For each new token:
-        # input_ids shape: (1, seq_len)
-
         toks = self.tokenizer.encode(prompt, return_tensors="pt")
         prompt_len = toks.shape[1]
 
@@ -106,12 +45,12 @@ class LLM:
             self.cache_manager.register_sequence(i)
 
         metrics.latency.start_prefill()
-        first_tok = self.prefill(toks, temperature, top_k)
+        first_tok = self.model_runner.prefill(toks, temperature, top_k)
         metrics.latency.end_prefill()
         toks = torch.cat([toks, first_tok.unsqueeze(0)], dim=-1)
 
         metrics.latency.start_decode()
-        toks = self.decode(toks, max_output_tokens, temperature, top_k)
+        toks = self.model_runner.decode(toks, max_output_tokens, temperature, top_k)
         metrics.latency.end_decode(max_output_tokens)
 
         metrics.latency.end_e2e()
